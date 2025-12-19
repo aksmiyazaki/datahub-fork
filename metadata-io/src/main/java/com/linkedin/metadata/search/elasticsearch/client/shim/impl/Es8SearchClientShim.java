@@ -180,19 +180,21 @@ import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.LoggingDeprecationHandler;
-import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.core.xcontent.ToXContent;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.index.reindex.BulkByScrollResponse;
 import org.opensearch.index.reindex.BulkByScrollTask;
 import org.opensearch.index.reindex.DeleteByQueryRequest;
 import org.opensearch.index.reindex.ReindexRequest;
 import org.opensearch.index.reindex.UpdateByQueryRequest;
 import org.opensearch.search.SearchException;
+import org.opensearch.search.SearchModule;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.search.builder.PointInTimeBuilder;
@@ -202,6 +204,7 @@ import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
 import org.opensearch.search.rescore.RescorerBuilder;
 import org.opensearch.search.slice.SliceBuilder;
 import org.opensearch.search.sort.SortBuilder;
+import org.opensearch.search.suggest.Suggest;
 import org.opensearch.search.suggest.SuggestBuilder;
 import org.opensearch.search.suggest.SuggestionBuilder;
 
@@ -407,10 +410,70 @@ public class Es8SearchClientShim implements ElasticSearchClientShim<Elasticsearc
     co.elastic.clients.elasticsearch.core.SearchResponse<JsonNode> esSearchResponse =
         withTransportOptions(options).search(esSearchRequest.build(), JsonNode.class);
     String json = JsonpUtils.toJsonString(esSearchResponse, jacksonJsonpMapper);
-    return SearchResponse.fromXContent(
-        XContentType.JSON
-            .xContent()
-            .createParser(X_CONTENT_REGISTRY, LoggingDeprecationHandler.INSTANCE, json));
+
+    // Extract and parse suggestions separately, then remove from JSON to avoid parsing errors
+    // The X_CONTENT_REGISTRY doesn't have suggestion parsers registered, which causes
+    // "unknown named object category [org.opensearch.search.suggest.Suggest$Suggestion]" errors
+    Suggest parsedSuggest = null;
+    try {
+      JsonNode jsonNode = objectMapper.readTree(json);
+      if (jsonNode.has("suggest")) {
+        JsonNode suggestNode = jsonNode.get("suggest");
+
+        // Remove suggestions from main JSON first to avoid parsing errors
+        // This must be done regardless of whether suggest is null or an object
+        ((com.fasterxml.jackson.databind.node.ObjectNode) jsonNode).remove("suggest");
+        json = objectMapper.writeValueAsString(jsonNode);
+
+        // Only try to parse suggestions if it's not null and not empty
+        if (suggestNode != null && !suggestNode.isNull() && !suggestNode.isEmpty()) {
+          String suggestJson = objectMapper.writeValueAsString(suggestNode);
+
+          // Parse suggestions using SearchModule's registry which includes suggestion parsers
+          SearchModule searchModule = new SearchModule(Settings.EMPTY, Collections.emptyList());
+          NamedXContentRegistry suggestRegistry =
+              new NamedXContentRegistry(searchModule.getNamedXContents());
+          parsedSuggest =
+              Suggest.fromXContent(
+                  XContentType.JSON
+                      .xContent()
+                      .createParser(
+                          suggestRegistry, LoggingDeprecationHandler.INSTANCE, suggestJson));
+        }
+      }
+    } catch (Exception e) {
+      log.warn(
+          "Failed to extract suggestions from response JSON, continuing without suggestions", e);
+      // Even if extraction failed, try to remove suggest field if it exists
+      try {
+        JsonNode jsonNode = objectMapper.readTree(json);
+        if (jsonNode.has("suggest")) {
+          ((com.fasterxml.jackson.databind.node.ObjectNode) jsonNode).remove("suggest");
+          json = objectMapper.writeValueAsString(jsonNode);
+        }
+      } catch (Exception ex) {
+        log.warn("Failed to remove suggest field from JSON after extraction error", ex);
+      }
+    }
+
+    SearchResponse searchResponse =
+        SearchResponse.fromXContent(
+            XContentType.JSON
+                .xContent()
+                .createParser(X_CONTENT_REGISTRY, LoggingDeprecationHandler.INSTANCE, json));
+
+    // Add suggestions back to SearchResponse using reflection
+    if (parsedSuggest != null) {
+      try {
+        Field suggestField = SearchResponse.class.getDeclaredField("suggest");
+        suggestField.setAccessible(true);
+        suggestField.set(searchResponse, parsedSuggest);
+      } catch (Exception e) {
+        log.warn("Failed to set suggestions on SearchResponse using reflection", e);
+      }
+    }
+
+    return searchResponse;
   }
 
   @Nonnull
@@ -1173,17 +1236,12 @@ public class Es8SearchClientShim implements ElasticSearchClientShim<Elasticsearc
   }
 
   private Action convertAliasAction(IndicesAliasesRequest.AliasActions aliasAction) {
-    try {
-      String jsonString =
-          aliasAction.toXContent(XContentFactory.jsonBuilder(), ToXContent.EMPTY_PARAMS).toString();
-      return Action.of(
-          q ->
-              q.withJson(
-                  jacksonJsonpMapper.jsonProvider().createParser(new StringReader(jsonString)),
-                  jacksonJsonpMapper));
-    } catch (IOException ie) {
-      throw new RuntimeException(ie);
-    }
+    String jsonString = Strings.toString(MediaTypeRegistry.JSON, aliasAction, true, true);
+    return Action.of(
+        q ->
+            q.withJson(
+                jacksonJsonpMapper.jsonProvider().createParser(new StringReader(jsonString)),
+                jacksonJsonpMapper));
   }
 
   @Nonnull
@@ -1656,7 +1714,7 @@ public class Es8SearchClientShim implements ElasticSearchClientShim<Elasticsearc
   }
 
   private FieldSuggester convertSuggestion(SuggestionBuilder<?> suggestionBuilder) {
-    String jsonString = suggestionBuilder.toString();
+    String jsonString = Strings.toString(MediaTypeRegistry.JSON, suggestionBuilder, true, true);
     return FieldSuggester.of(
         q ->
             q.withJson(
